@@ -106,6 +106,7 @@ from ucode.mcp import (
     purge_cross_workspace_mcp_residue,
     remove_mcp_command,
     revert_mcp_configs,
+    skill_locations_for_client,
 )
 from ucode.skills_download import (
     configure_skills_download_command,
@@ -1068,17 +1069,31 @@ def status() -> int:
     if not skill_mcp_entry:
         print_kv("Skills", "not configured")
     else:
-        locations = skill_mcp_entry.get("skill_locations") or []
-        print_kv(
-            "Skill MCP Locations",
-            ", ".join(locations) if locations else "none — utility tools only",
-        )
-        configured_agents = [
-            str(MCP_CLIENTS[client]["display"])
-            for client in (skill_mcp_entry.get("clients") or [])
-            if client in MCP_CLIENTS
+        configured_clients = [
+            client for client in (skill_mcp_entry.get("clients") or []) if client in MCP_CLIENTS
         ]
-        print_kv("Configured", ", ".join(configured_agents) if configured_agents else "none")
+        scopes = {
+            client: skill_locations_for_client(skill_mcp_entry, client)
+            for client in configured_clients
+        }
+        if len({tuple(locations) for locations in scopes.values()}) <= 1:
+            locations = next(
+                iter(scopes.values()), list(skill_mcp_entry.get("skill_locations") or [])
+            )
+            print_kv(
+                "Skill MCP Locations",
+                ", ".join(locations) if locations else "none — utility tools only",
+            )
+            configured_agents = [
+                str(MCP_CLIENTS[client]["display"]) for client in configured_clients
+            ]
+            print_kv("Configured", ", ".join(configured_agents) if configured_agents else "none")
+        else:
+            for client, locations in scopes.items():
+                print_kv(
+                    f"{MCP_CLIENTS[client]['display']} skill MCP locations",
+                    ", ".join(locations) if locations else "none — utility tools only",
+                )
 
     print_heading("Tracing")
     tracing = state.get("tracing") or {}
@@ -1353,6 +1368,14 @@ def skills_add(
             "Not valid with --mcp.",
         ),
     ] = None,
+    agents: Annotated[
+        str | None,
+        typer.Option(
+            "--agents",
+            help="(--mcp only) Comma-separated coding agents whose skills MCP scope should "
+            "be updated. Any that aren't configured yet are set up first.",
+        ),
+    ] = None,
 ) -> None:
     """Add Databricks Skills to your coding tools, keeping any already configured.
 
@@ -1368,6 +1391,11 @@ def skills_add(
         locations = _parse_skill_locations(location)
         requested_skills = (
             None if skills is None else {s.strip() for s in skills.split(",") if s.strip()}
+        )
+        requested_agents = (
+            None
+            if agents is None
+            else ({agent.strip().lower() for agent in agents.split(",") if agent.strip()} or None)
         )
         if mcp and path is not None:
             raise RuntimeError("--path is not supported when using --mcp")
@@ -1389,6 +1417,8 @@ def skills_add(
                 "`<catalog>.<schema>.<name>` values "
                 f"(invalid: {', '.join(sorted(invalid_skills))})."
             )
+        if not mcp and agents is not None:
+            raise RuntimeError("--agents is only supported when using --mcp")
         if requested_skills is not None and not locations:
             schemas = {".".join(parts[:2]) for parts in qualified_skill_parts.values()}
             bare = sorted(skill for skill in requested_skills if skill not in qualified_skill_parts)
@@ -1426,7 +1456,13 @@ def skills_add(
             None if requested_skills is None else {s.split(".")[-1] for s in requested_skills}
         )
         if mcp:
-            add_skills_command(locations)
+            scope = (
+                _configure_agents_for_mcp(sorted(requested_agents)) if requested_agents else None
+            )
+            if scope is None:
+                add_skills_command(locations)
+            else:
+                add_skills_command(locations, agents=scope)
         else:
             configure_skills_download_command(locations, path=path, skills=selected_skills)
     except (RuntimeError, ValueError) as exc:
